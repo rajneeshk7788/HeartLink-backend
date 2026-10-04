@@ -1,0 +1,60 @@
+{
+  "family": "connectpulse-backend-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "connectpulse-backend",
+      "image": "YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_AWS_REGION.amazonaws.com/connectpulse-backend:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 5000,
+          "hostPort": 5000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "name": "PORT",
+          "value": "5000"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "MONGODB_URI",
+          "valueFrom": "arn:aws:secretsmanager:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:secret:connectpulse/MONGODB_URI"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:secret:connectpulse/JWT_SECRET"
+        },
+        {
+          "name": "JWT_REFRESH_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:secret:connectpulse/JWT_REFRESH_SECRET"
+        },
+        {
+          "name": "CLIENT_URL",
+          "valueFrom": "arn:aws:secretsmanager:YOUR_AWS_REGION:YOUR_AWS_ACCOUNT_ID:secret:connectpulse/CLIENT_URL"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/connectpulse-backend",
+          "awslogs-region": "YOUR_AWS_REGION",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
