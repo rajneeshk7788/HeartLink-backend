@@ -19,7 +19,35 @@ import { registerPresenceHandlers } from './sockets/presence.socket';
 import { registerChatHandlers } from './sockets/chat.socket';
 import { registerCallHandlers } from './sockets/call.socket';
 
+/**
+ * On Windows two processes can end up listening on the same port at once, and
+ * requests then hit either one at random. Refuse to start if something already
+ * answers on our port.
+ */
+async function ensurePortIsFree(port: number): Promise<void> {
+  const answering = await new Promise<boolean>((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/api/health', timeout: 1500 }, (res) => {
+      res.resume();
+      resolve(true);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
+  });
+  if (answering) {
+    console.error(`[Server] ❌ Another server is already running on port ${port}.`);
+    console.error('[Server]    Stop it first (close its terminal, or find it with:');
+    console.error(`[Server]      netstat -ano | findstr :${port}   then   taskkill /PID <pid> /F)`);
+    console.error('[Server]    or start this one on another port: set PORT in backend/.env');
+    process.exit(1);
+  }
+}
+
 async function startServer() {
+  await ensurePortIsFree(config.port);
+
   const app = express();
   const httpServer = http.createServer(app);
 
