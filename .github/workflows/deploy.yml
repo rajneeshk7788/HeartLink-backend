@@ -1,0 +1,133 @@
+name: CI / Deploy to Render
+
+# Every push to main: build + end-to-end tests, then deploy to Render if they pass.
+# Pull requests: build + tests only.
+# "Run workflow" button (Actions tab): same as a push to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & end-to-end tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Skip downloading the local-dev MongoDB binary (CI uses the mongo service above)
+      MONGOMS_DISABLE_POSTINSTALL: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Start server (production mode)
+        env:
+          NODE_ENV: production
+          PORT: '5000'
+          MONGODB_URI: mongodb://localhost:27017/heartlink_ci
+          JWT_SECRET: ci-only-access-secret
+          JWT_REFRESH_SECRET: ci-only-refresh-secret
+          SEED_DEMO_DATA: 'true'
+        run: |
+          node dist/server.js > server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:5000/api/health > /dev/null; then
+              echo "Server is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Server did not start"; cat server.log; exit 1
+
+      - name: End-to-end smoke tests
+        env:
+          SMOKE_BASE_URL: http://localhost:5000
+        run: npm run test:smoke
+
+      - name: Server log
+        if: always()
+        run: cat server.log || true
+
+  deploy:
+    name: Deploy to Render
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Never run two deploys at once; queue them instead
+    concurrency:
+      group: render-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ vars.RENDER_SERVICE_URL }}
+
+    steps:
+      - name: Check configuration
+        id: config
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK_URL secret is not set, skipping deploy. Add it under Settings → Secrets and variables → Actions."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Render deploy of this commit
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          # ref= pins the deploy to the exact commit that passed the tests
+          response=$(curl -fsS -X POST "${HOOK}&ref=${GITHUB_SHA}")
+          echo "Render accepted the deploy: $(echo "$response" | grep -o '"id":"[^"]*"' | head -1)"
+
+      - name: Wait for the new version to go live
+        if: steps.config.outputs.enabled == 'true' && vars.RENDER_SERVICE_URL != ''
+        env:
+          SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: |
+          # /api/health reports the commit Render is serving (RENDER_GIT_COMMIT)
+          for i in $(seq 1 90); do
+            commit=$(curl -fsS --max-time 60 "${SERVICE_URL%/}/api/health" 2>/dev/null | grep -o '"commit":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ "$commit" = "$GITHUB_SHA" ]; then
+              echo "Deploy of ${GITHUB_SHA} is live at ${SERVICE_URL}"
+              exit 0
+            fi
+            echo "Waiting for deploy... (serving: ${commit:-unavailable})"
+            sleep 10
+          done
+          echo "::error::Timed out waiting for ${GITHUB_SHA} to go live. Check the Render dashboard logs."
+          exit 1

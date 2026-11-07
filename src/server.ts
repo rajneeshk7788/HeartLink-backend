@@ -53,6 +53,8 @@ async function startServer() {
     res.json({
       status: 'ok',
       service: 'ConnectPulse API',
+      // Git commit being served (set automatically by Render); lets CI confirm a deploy went live
+      commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
       timestamp: new Date().toISOString(),
       architecture: {
         auth: 'REST API',

@@ -1,6 +1,8 @@
 # Render Blueprint — https://render.com/docs/blueprint-spec
-# In Render: New + → Blueprint → pick this GitHub repo. Render reads this file,
+# In Render: New + → Blueprint → paste this repo's URL. Render reads this file,
 # generates the JWT secrets and asks you only for the values marked `sync: false`.
+# Deploys are driven by GitHub Actions (.github/workflows/deploy.yml) through the
+# service's Deploy Hook, after the tests pass — not by Render auto-deploy.
 services:
   - type: web
     name: heartlink-backend
@@ -12,7 +14,8 @@ services:
     buildCommand: npm ci --include=dev && npm run build && npm prune --omit=dev
     startCommand: node dist/server.js
     healthCheckPath: /api/health
-    autoDeploy: true
+    # GitHub Actions triggers deploys after tests pass
+    autoDeploy: false
     envVars:
       - key: NODE_ENV
         value: production

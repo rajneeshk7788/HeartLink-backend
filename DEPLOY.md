@@ -1,7 +1,7 @@
 # Deploying the HeartLink / ConnectPulse backend (Render + MongoDB Atlas, free)
 
-Total time: about 15 minutes. You need a GitHub account (you have one), plus free
-**MongoDB Atlas** and **Render** accounts.
+Total time: about 15 minutes. You need free **MongoDB Atlas** and **Render** accounts.
+Deploys run through **GitHub Actions** after the tests pass.
 
 ---
 
@@ -34,27 +34,45 @@ Optional check from your PC: put it in `backend/.env` as `MONGODB_URI=...` and r
 
 ---
 
-## Step 2: Deploy on Render
+## Step 2: Create the service on Render
 
-1. Sign up at <https://render.com> with **"Sign in with GitHub"**, and allow it access to
-   the `HeartLink-backend` repository.
-2. **New + → Blueprint** → select `rajneeshk7788/HeartLink-backend` → branch `main`.
+1. Sign in at <https://render.com>.
+2. **New + → Blueprint**. Under **Public Git Repository**, paste
+   `https://github.com/rajneeshk7788/HeartLink-backend` → **Continue**.
    Render reads [`render.yaml`](render.yaml) and shows the service `heartlink-backend`.
 3. Fill in the values it asks for:
    - **MONGODB_URI**: the Atlas string from Step 1.
-   - **SMTP_HOST / SMTP_USER / SMTP_PASS / SMTP_FROM**: leave **empty** for now (only needed
-     for "Forgot password" emails, see below).
-4. **Apply / Deploy Blueprint.** The first build takes about 3–5 minutes. Logs should end with
-   ```
-   [DB] Connected successfully to primary MongoDB instance.
-   🚀 ConnectPulse Server running on 0.0.0.0:10000
-   ```
-5. Copy your URL from the top of the service page, e.g.
-   `https://heartlink-backend.onrender.com` (Render adds a suffix if the name is taken).
-6. Test it in a browser: `https://<your-url>/api/health` should show `"status":"ok"`.
+   - **SMTP_***: leave empty for now (only needed for "Forgot password" emails).
+4. **Deploy Blueprint.** The first build takes about 3–5 minutes. Logs should end with
+   `[DB] Connected successfully to primary MongoDB instance.`
+5. Copy the service URL from the top of the page, e.g. `https://heartlink-backend.onrender.com`.
+   Check `https://<your-url>/api/health` shows `"status":"ok"`.
 
-Render generates `JWT_SECRET` and `JWT_REFRESH_SECRET` automatically. Every later
-`git push` to `main` redeploys automatically.
+Render generates `JWT_SECRET` and `JWT_REFRESH_SECRET` automatically.
+
+## Step 3: Let GitHub Actions deploy (CI/CD)
+
+The pipeline is [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
+
+```
+push to main ─▶ build + type-check ─▶ end-to-end tests (real MongoDB) ─▶ Render deploy hook ─▶ wait until live
+pull request ─▶ build + type-check ─▶ end-to-end tests                  (no deploy)
+```
+
+Render's own auto-deploy is off (`autoDeploy: false`). Code only goes live after the tests pass.
+
+One-time setup:
+1. **Render → heartlink-backend → Settings → Deploy Hook → copy** the URL
+   (`https://api.render.com/deploy/srv-...?key=...`). It's a secret: anyone with it can trigger deploys.
+2. **GitHub → HeartLink-backend → Settings → Secrets and variables → Actions:**
+   - **Secrets** tab → **New repository secret**: name `RENDER_DEPLOY_HOOK_URL`, value = the hook URL.
+   - **Variables** tab → **New repository variable**: name `RENDER_SERVICE_URL`,
+     value = `https://<your-url>` (no trailing slash). The pipeline uses it to wait until the new
+     version is live.
+3. **Actions tab → "CI / Deploy to Render" → Run workflow** (or push any commit to `main`).
+
+Each run's **Deploy to Render** job finishes green only once `/api/health` reports the new commit.
+Until the secret exists, the deploy job is skipped with a warning (tests still run).
 
 ### Free-plan behaviour
 - The service **sleeps after 15 minutes without traffic**. The next request wakes it in about
@@ -64,7 +82,7 @@ Render generates `JWT_SECRET` and `JWT_REFRESH_SECRET` automatically. Every late
 
 ---
 
-## Step 3: Point the Android app at the hosted backend
+## Step 4: Point the Android app at the hosted backend
 
 ```bash
 # 1. Put your Render URL in mobile/app.env.json:
