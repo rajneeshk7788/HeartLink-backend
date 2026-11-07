@@ -1,0 +1,53 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# In Render: New + → Blueprint → pick this GitHub repo. Render reads this file,
+# generates the JWT secrets and asks you only for the values marked `sync: false`.
+services:
+  - type: web
+    name: heartlink-backend
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    # TypeScript is a dev dependency, so install it for the build, then drop dev deps.
+    buildCommand: npm ci --include=dev && npm run build && npm prune --omit=dev
+    startCommand: node dist/server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      # Skip downloading the local-dev MongoDB binary during the build
+      - key: MONGOMS_DISABLE_POSTINSTALL
+        value: "1"
+      # Login token signing keys (random, generated once by Render)
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_EXPIRES_IN
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: 7d
+      # MongoDB Atlas connection string — paste it in the Render dashboard (never commit it)
+      - key: MONGODB_URI
+        sync: false
+      # Allowed browser origins for the web app (comma-separated). The Android app
+      # does not need this. Leave as-is until the web frontend is hosted.
+      - key: CLIENT_URL
+        value: http://localhost:5173
+      # Demo users alice/bob/charlie (password Password123!). Set to "true" only for testing.
+      - key: SEED_DEMO_DATA
+        value: "false"
+      # Optional: SMTP for password-reset emails (forgot password does not work without it)
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false

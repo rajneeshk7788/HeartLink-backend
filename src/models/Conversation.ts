@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema, Model } from 'mongoose';
+import { jsonOptions } from './serialize';
 
 export interface IUnreadCount {
   userId: mongoose.Types.ObjectId;
@@ -44,6 +45,7 @@ const ConversationSchema = new Schema<IConversation>(
   },
   {
     timestamps: true,
+    toJSON: jsonOptions,
   }
 );
 

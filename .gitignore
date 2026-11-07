@@ -38,3 +38,6 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+# Local development database (created automatically when MongoDB is not installed)
+.local-db/

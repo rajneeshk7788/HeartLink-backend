@@ -31,7 +31,8 @@ export const typeDefs = `#graphql
   type User {
     id: ID!
     username: String!
-    email: String!
+    "Only visible on your own user record; null for everyone else."
+    email: String
     displayName: String!
     avatar: String
     bio: String
@@ -112,6 +113,7 @@ export const typeDefs = `#graphql
     CreateConversation(participantId: ID!): Conversation!
     SendMessage(conversationId: ID!, content: String!, type: MessageType): Message!
     MarkMessageAsRead(messageId: ID!): Message!
+    MarkConversationAsRead(conversationId: ID!): Conversation!
     DeleteMessage(messageId: ID!): Boolean!
     CreateCallRecord(input: CreateCallInput!): CallRecord!
     UpdateCallStatus(callId: ID!, status: CallStatus!, duration: Int): CallRecord!

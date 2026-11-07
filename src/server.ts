@@ -1,12 +1,13 @@
 import http from 'http';
+import os from 'os';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { ApolloServer } from '@apollo/server';
 import { expressMiddleware } from '@apollo/server/express4';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 
-import { config } from './config';
-import { connectDB } from './config/db';
+import { config, isOriginAllowed } from './config';
+import { connectDB, disconnectDB } from './config/db';
 import authRoutes from './routes/auth.routes';
 import { typeDefs } from './graphql/schema/typeDefs';
 import { resolvers, GraphQLContext } from './graphql/resolvers';
@@ -22,16 +23,27 @@ async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
 
-  // Cross-Origin Resource Sharing
+  // Behind a load balancer / reverse proxy, trust the first hop for req.ip (rate limiting)
+  if (config.isProduction) {
+    app.set('trust proxy', 1);
+  }
+  app.disable('x-powered-by');
+
+  // Cross-Origin Resource Sharing: only the configured client origins (no wildcard)
+  const corsOrigin = (
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: boolean) => void
+  ) => callback(null, isOriginAllowed(origin));
+
   app.use(
     cors({
-      origin: [config.clientUrl, 'http://localhost:5173', 'http://127.0.0.1:5173', '*'],
+      origin: corsOrigin,
       credentials: true,
     })
   );
 
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
   // REST API Routes - Strictly Authentication Only
   app.use('/api/auth', authRoutes);
@@ -55,9 +67,15 @@ async function startServer() {
   const apolloServer = new ApolloServer<GraphQLContext>({
     typeDefs,
     resolvers,
-    formatError: (formattedError, error) => {
-      console.error('[GraphQL Error]:', formattedError);
-      return formattedError;
+    introspection: !config.isProduction,
+    formatError: (formattedError) => {
+      const code = formattedError.extensions?.code;
+      if (code === 'INTERNAL_SERVER_ERROR') {
+        console.error('[GraphQL Error]:', formattedError);
+      }
+      // Never leak stack traces to clients
+      const { stacktrace, ...extensions } = (formattedError.extensions || {}) as any;
+      return { ...formattedError, extensions };
     },
   });
 
@@ -77,10 +95,11 @@ async function startServer() {
   // Socket.IO Server (Real-Time Events & WebRTC Signaling)
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: [config.clientUrl, 'http://localhost:5173', 'http://127.0.0.1:5173', '*'],
+      origin: corsOrigin,
       methods: ['GET', 'POST'],
       credentials: true,
     },
+    maxHttpBufferSize: 1e6,
     transports: ['websocket', 'polling'],
   });
 
@@ -131,17 +150,49 @@ async function startServer() {
 
   // Connect Database, Seed Starter Data, and Listen
   await connectDB();
-  const { seedInitialData } = await import('./utils/seed');
-  await seedInitialData();
 
-  httpServer.listen(config.port, () => {
+  // Nobody is connected right after a (re)start: clear stale presence flags
+  await User.updateMany({ isOnline: true }, { $set: { isOnline: false } });
+
+  if (config.seedDemoData) {
+    const { seedInitialData } = await import('./utils/seed');
+    await seedInitialData();
+  }
+
+  httpServer.on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[Server] Port ${config.port} is already in use. Stop the other server (or set PORT in backend/.env) and try again.`);
+      process.exit(1);
+    }
+    throw err;
+  });
+
+  httpServer.listen(config.port, config.host, () => {
+    const lanAddresses = Object.values(os.networkInterfaces())
+      .flat()
+      .filter((a): a is os.NetworkInterfaceInfo => !!a && a.family === 'IPv4' && !a.internal)
+      .map((a) => a.address);
+
     console.log(`=======================================================`);
-    console.log(`🚀 ConnectPulse Server running on port ${config.port}`);
+    console.log(`🚀 ConnectPulse Server running on ${config.host}:${config.port}`);
     console.log(`🔐 REST Auth API:       http://localhost:${config.port}/api/auth`);
     console.log(`📊 GraphQL Endpoint:    http://localhost:${config.port}/graphql`);
     console.log(`⚡ Socket.IO Server:    ws://localhost:${config.port}`);
+    console.log(`📱 Android emulator:    http://10.0.2.2:${config.port}`);
+    lanAddresses.forEach((ip) => console.log(`📱 Phone on same Wi-Fi: http://${ip}:${config.port}`));
     console.log(`=======================================================`);
   });
+
+  const shutdown = async (signal: string) => {
+    console.log(`[Server] ${signal} received, shutting down...`);
+    io.close();
+    await apolloServer.stop().catch(() => undefined);
+    httpServer.close();
+    await disconnectDB();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 startServer().catch((err) => {

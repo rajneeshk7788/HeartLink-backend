@@ -1,9 +1,9 @@
 import { Server, Socket } from 'socket.io';
 import { User } from '../models/User';
-import { onlineUsers } from './socketManager';
+import { onlineUsers, getOnlineUserIds } from './socketManager';
 
 export const registerPresenceHandlers = (io: Server, socket: Socket): void => {
-  const userId = socket.data.userId;
+  const userId: string = socket.data.userId;
   if (!userId) return;
 
   // Add socket ID to user's set of connections
@@ -19,19 +19,23 @@ export const registerPresenceHandlers = (io: Server, socket: Socket): void => {
 
   // If user just came online from 0 active connections
   if (wasOffline) {
-    User.findByIdAndUpdate(userId, { isOnline: true, lastSeen: new Date() }).exec();
-    io.emit('user:online', {
+    const now = new Date();
+    User.findByIdAndUpdate(userId, { isOnline: true, lastSeen: now })
+      .exec()
+      .catch((err) => console.error('[Presence] Failed to mark online:', err.message));
+    socket.broadcast.emit('user:online', {
       userId,
       isOnline: true,
-      lastSeen: new Date().toISOString(),
+      lastSeen: now.toISOString(),
     });
   }
 
+  // Push the full online list to the newly connected client
+  socket.emit('presence:sync', { onlineUserIds: getOnlineUserIds() });
+
   // Client requests list of all currently online users
   socket.on('users:get_online', (callback?: (onlineUserIds: string[]) => void) => {
-    const onlineList = Array.from(onlineUsers.keys()).filter(
-      (uid) => (onlineUsers.get(uid)?.size || 0) > 0
-    );
+    const onlineList = getOnlineUserIds();
     if (typeof callback === 'function') {
       callback(onlineList);
     } else {
@@ -42,18 +46,21 @@ export const registerPresenceHandlers = (io: Server, socket: Socket): void => {
   // Handle disconnect
   socket.on('disconnect', async () => {
     const currentSockets = onlineUsers.get(userId);
-    if (currentSockets) {
-      currentSockets.delete(socket.id);
-      if (currentSockets.size === 0) {
-        onlineUsers.delete(userId);
-        const lastSeen = new Date();
+    if (!currentSockets) return;
+    currentSockets.delete(socket.id);
+    if (currentSockets.size === 0) {
+      onlineUsers.delete(userId);
+      const lastSeen = new Date();
+      try {
         await User.findByIdAndUpdate(userId, { isOnline: false, lastSeen }).exec();
-        io.emit('user:offline', {
-          userId,
-          isOnline: false,
-          lastSeen: lastSeen.toISOString(),
-        });
+      } catch (err: any) {
+        console.error('[Presence] Failed to mark offline:', err.message);
       }
+      io.emit('user:offline', {
+        userId,
+        isOnline: false,
+        lastSeen: lastSeen.toISOString(),
+      });
     }
   });
 };

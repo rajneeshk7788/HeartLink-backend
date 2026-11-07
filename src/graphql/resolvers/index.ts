@@ -2,7 +2,7 @@ import { GraphQLError } from 'graphql';
 import { UserService } from '../../services/user/user.service';
 import { MessageService } from '../../services/message/message.service';
 import { CallService } from '../../services/call/call.service';
-import { emitToConversation, emitToUser, isUserOnline } from '../../sockets/socketManager';
+import { emitToUser, emitToUsers, isUserOnline } from '../../sockets/socketManager';
 import { IUser } from '../../models/User';
 
 export interface GraphQLContext {
@@ -18,22 +18,50 @@ const checkAuth = (context: GraphQLContext): IUser => {
   return context.user;
 };
 
+/** Converts service errors into client-friendly GraphQL errors. */
+const run = async <T>(fn: () => Promise<T>): Promise<T> => {
+  try {
+    return await fn();
+  } catch (err: any) {
+    if (err instanceof GraphQLError) throw err;
+    const message: string = err?.message || 'Request failed';
+    const code = /not found|access denied/i.test(message)
+      ? 'NOT_FOUND'
+      : /not authorized/i.test(message)
+        ? 'FORBIDDEN'
+        : 'BAD_USER_INPUT';
+    throw new GraphQLError(message, { extensions: { code } });
+  }
+};
+
+const idOf = (parent: any): string => parent?._id?.toString() || parent?.id;
+
+const toISO = (value: any): string | null => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+// Non-null timestamp fields fall back to "now" rather than crashing on partial documents
+const toISORequired = (value: any): string => toISO(value) || new Date().toISOString();
+
+const serialize = (doc: any) => (doc && typeof doc.toJSON === 'function' ? doc.toJSON() : doc);
+
 export const resolvers = {
   User: {
-    id: (parent: any) => parent._id?.toString() || parent.id,
-    isOnline: (parent: any) => {
-      // Check real-time active socket connection or db state
-      return isUserOnline(parent._id?.toString() || parent.id) || !!parent.isOnline;
-    },
-    createdAt: (parent: any) => new Date(parent.createdAt).toISOString(),
-    updatedAt: (parent: any) => new Date(parent.updatedAt).toISOString(),
-    lastSeen: (parent: any) => (parent.lastSeen ? new Date(parent.lastSeen).toISOString() : null),
+    id: idOf,
+    // Email is private: only returned on the requesting user's own record
+    email: (parent: any, _: any, context: GraphQLContext) =>
+      context.user && idOf(parent) === context.user._id.toString() ? parent.email || null : null,
+    isOnline: (parent: any) => isUserOnline(idOf(parent)),
+    createdAt: (parent: any) => toISORequired(parent.createdAt),
+    updatedAt: (parent: any) => toISORequired(parent.updatedAt),
+    lastSeen: (parent: any) => toISO(parent.lastSeen),
   },
 
   Conversation: {
-    id: (parent: any) => parent._id?.toString() || parent.id,
-    createdAt: (parent: any) => new Date(parent.createdAt).toISOString(),
-    updatedAt: (parent: any) => new Date(parent.updatedAt).toISOString(),
+    id: idOf,
+    createdAt: (parent: any) => toISORequired(parent.createdAt),
+    updatedAt: (parent: any) => toISORequired(parent.updatedAt),
   },
 
   UnreadCount: {
@@ -42,47 +70,42 @@ export const resolvers = {
   },
 
   Message: {
-    id: (parent: any) => parent._id?.toString() || parent.id,
+    id: idOf,
     conversationId: (parent: any) => parent.conversationId?.toString() || parent.conversationId,
     readBy: (parent: any) => (parent.readBy || []).map((id: any) => id.toString()),
-    createdAt: (parent: any) => new Date(parent.createdAt).toISOString(),
-    updatedAt: (parent: any) => new Date(parent.updatedAt).toISOString(),
+    createdAt: (parent: any) => toISORequired(parent.createdAt),
+    updatedAt: (parent: any) => toISORequired(parent.updatedAt),
   },
 
   CallRecord: {
-    id: (parent: any) => parent._id?.toString() || parent.id,
+    id: idOf,
     conversationId: (parent: any) => (parent.conversationId ? parent.conversationId.toString() : null),
-    startedAt: (parent: any) => (parent.startedAt ? new Date(parent.startedAt).toISOString() : null),
-    endedAt: (parent: any) => (parent.endedAt ? new Date(parent.endedAt).toISOString() : null),
-    createdAt: (parent: any) => new Date(parent.createdAt).toISOString(),
-    updatedAt: (parent: any) => new Date(parent.updatedAt).toISOString(),
+    startedAt: (parent: any) => toISO(parent.startedAt),
+    endedAt: (parent: any) => toISO(parent.endedAt),
+    createdAt: (parent: any) => toISORequired(parent.createdAt),
+    updatedAt: (parent: any) => toISORequired(parent.updatedAt),
   },
 
   Query: {
-    GetCurrentUser: async (_: any, __: any, context: GraphQLContext) => {
-      const user = checkAuth(context);
-      return user;
-    },
+    GetCurrentUser: async (_: any, __: any, context: GraphQLContext) => checkAuth(context),
 
     SearchUsers: async (_: any, { query }: { query?: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return UserService.searchUsers(query || '', user._id.toString());
+      return run(() => UserService.searchUsers(query || '', user._id.toString()));
     },
 
     GetUserProfile: async (_: any, { userId }: { userId: string }, context: GraphQLContext) => {
       checkAuth(context);
       const profile = await UserService.getUserProfile(userId);
       if (!profile) {
-        throw new GraphQLError('User not found', {
-          extensions: { code: 'NOT_FOUND' },
-        });
+        throw new GraphQLError('User not found', { extensions: { code: 'NOT_FOUND' } });
       }
       return profile;
     },
 
     GetConversations: async (_: any, __: any, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return MessageService.getConversations(user._id.toString());
+      return run(() => MessageService.getConversations(user._id.toString()));
     },
 
     GetConversation: async (_: any, { conversationId }: { conversationId: string }, context: GraphQLContext) => {
@@ -101,124 +124,120 @@ export const resolvers = {
       { conversationId, limit, offset }: { conversationId: string; limit?: number; offset?: number },
       context: GraphQLContext
     ) => {
-      checkAuth(context);
-      return MessageService.getMessages(conversationId, limit, offset);
+      const user = checkAuth(context);
+      return run(() =>
+        MessageService.getMessages(conversationId, user._id.toString(), limit ?? 50, offset ?? 0)
+      );
     },
 
     GetCallHistory: async (_: any, __: any, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return CallService.getCallHistory(user._id.toString());
+      return run(() => CallService.getCallHistory(user._id.toString()));
     },
   },
 
   Mutation: {
-    UpdateProfile: async (
-      _: any,
-      { input }: { input: any },
-      context: GraphQLContext
-    ) => {
+    UpdateProfile: async (_: any, { input }: { input: any }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return UserService.updateProfile(user._id.toString(), input);
+      return run(() => UserService.updateProfile(user._id.toString(), input || {}));
     },
 
-    CreateConversation: async (
-      _: any,
-      { participantId }: { participantId: string },
-      context: GraphQLContext
-    ) => {
+    CreateConversation: async (_: any, { participantId }: { participantId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      const conversation = await MessageService.createConversation(
-        user._id.toString(),
-        participantId
+      const conversation = await run(() =>
+        MessageService.createConversation(user._id.toString(), participantId)
       );
 
-      // Notify the participant that a conversation has been created
-      emitToUser(participantId, 'conversation:created', conversation);
+      // Notify the participant that a conversation is available
+      emitToUser(participantId, 'conversation:created', serialize(conversation));
 
       return conversation;
     },
 
     SendMessage: async (
       _: any,
-      {
-        conversationId,
-        content,
-        type,
-      }: { conversationId: string; content: string; type?: any },
+      { conversationId, content, type }: { conversationId: string; content: string; type?: any },
       context: GraphQLContext
     ) => {
       const user = checkAuth(context);
-      const message = await MessageService.sendMessage(
-        user._id.toString(),
-        conversationId,
-        content,
-        type
+      const { message, participantIds } = await run(() =>
+        MessageService.sendMessage(user._id.toString(), conversationId, content, type || 'text')
       );
 
-      // Real-time broadcast to room
-      emitToConversation(conversationId, 'message:new', message);
+      // Deliver to every device of every participant (chat list + open chat both update)
+      emitToUsers(participantIds, 'message:new', serialize(message));
 
       return message;
     },
 
-    MarkMessageAsRead: async (
-      _: any,
-      { messageId }: { messageId: string },
-      context: GraphQLContext
-    ) => {
+    MarkMessageAsRead: async (_: any, { messageId }: { messageId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      const message = await MessageService.markMessageAsRead(
-        messageId,
+      const message = await run(() => MessageService.markMessageAsRead(messageId, user._id.toString()));
+      const conversation = await MessageService.getConversation(
+        message.conversationId.toString(),
         user._id.toString()
       );
 
-      // Real-time notification of read status
-      emitToConversation(message.conversationId.toString(), 'message:read', {
-        messageId: message._id.toString(),
-        userId: user._id.toString(),
-      });
+      emitToUsers(
+        (conversation?.participants || []).map((p: any) => idOf(p)),
+        'message:read',
+        {
+          conversationId: message.conversationId.toString(),
+          messageId: message._id.toString(),
+          userId: user._id.toString(),
+        }
+      );
 
       return message;
     },
 
-    DeleteMessage: async (
+    MarkConversationAsRead: async (
       _: any,
-      { messageId }: { messageId: string },
+      { conversationId }: { conversationId: string },
       context: GraphQLContext
     ) => {
       const user = checkAuth(context);
-      const deleted = await MessageService.deleteMessage(
-        messageId,
-        user._id.toString()
+      const { conversation, messageIds } = await run(() =>
+        MessageService.markConversationAsRead(conversationId, user._id.toString())
       );
-      return deleted;
+
+      emitToUsers(
+        conversation.participants.map((p: any) => idOf(p)),
+        'conversation:read',
+        { conversationId, userId: user._id.toString(), messageIds }
+      );
+
+      return conversation;
     },
 
-    CreateCallRecord: async (
-      _: any,
-      { input }: { input: any },
-      context: GraphQLContext
-    ) => {
+    DeleteMessage: async (_: any, { messageId }: { messageId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return CallService.createCallRecord({
-        callerId: user._id.toString(),
-        receiverId: input.receiverId,
-        callType: input.callType,
-        conversationId: input.conversationId,
-      });
+      const { conversationId, participantIds } = await run(() =>
+        MessageService.deleteMessage(messageId, user._id.toString())
+      );
+      emitToUsers(participantIds, 'message:deleted', { conversationId, messageId });
+      return true;
+    },
+
+    CreateCallRecord: async (_: any, { input }: { input: any }, context: GraphQLContext) => {
+      const user = checkAuth(context);
+      return run(() =>
+        CallService.createCallRecord({
+          callerId: user._id.toString(),
+          receiverId: input.receiverId,
+          callType: input.callType,
+          conversationId: input.conversationId,
+        })
+      );
     },
 
     UpdateCallStatus: async (
       _: any,
-      {
-        callId,
-        status,
-        duration,
-      }: { callId: string; status: any; duration?: number },
+      { callId, status, duration }: { callId: string; status: any; duration?: number },
       context: GraphQLContext
     ) => {
-      checkAuth(context);
-      return CallService.updateCallStatus(callId, status, duration);
+      const user = checkAuth(context);
+      return run(() => CallService.updateCallStatus(callId, status, duration, user._id.toString()));
     },
   },
 };

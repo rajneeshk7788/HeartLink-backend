@@ -1,4 +1,4 @@
-import { Server, Socket } from 'socket.io';
+import { Server } from 'socket.io';
 
 let ioInstance: Server | null = null;
 
@@ -22,6 +22,13 @@ export const emitToUser = (userId: string, event: string, data: any): void => {
   }
 };
 
+/** Emit once to every device of every listed user (socket.io de-duplicates across rooms). */
+export const emitToUsers = (userIds: string[], event: string, data: any): void => {
+  if (ioInstance && userIds.length > 0) {
+    ioInstance.to(userIds.map((id) => `user:${id}`)).emit(event, data);
+  }
+};
+
 export const emitToConversation = (conversationId: string, event: string, data: any): void => {
   if (ioInstance) {
     ioInstance.to(`conversation:${conversationId}`).emit(event, data);
@@ -32,3 +39,8 @@ export const isUserOnline = (userId: string): boolean => {
   const sockets = onlineUsers.get(userId.toString());
   return !!sockets && sockets.size > 0;
 };
+
+export const getOnlineUserIds = (): string[] =>
+  Array.from(onlineUsers.entries())
+    .filter(([, sockets]) => sockets.size > 0)
+    .map(([uid]) => uid);

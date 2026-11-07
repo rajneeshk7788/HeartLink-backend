@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema, Model } from 'mongoose';
+import { jsonOptions } from './serialize';
 
 export type CallType = 'audio' | 'video';
 export type CallStatus = 'initiated' | 'ringing' | 'accepted' | 'rejected' | 'missed' | 'completed' | 'busy';
@@ -61,6 +62,7 @@ const CallRecordSchema = new Schema<ICallRecord>(
   },
   {
     timestamps: true,
+    toJSON: jsonOptions,
   }
 );
 

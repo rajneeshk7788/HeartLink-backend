@@ -1,13 +1,22 @@
 import { Response } from 'express';
 import { AuthService } from '../../services/auth/auth.service';
 import { AuthenticatedRequest } from '../../middleware/auth.middleware';
+import { verifyAccessToken } from '../../utils/jwt';
+
+const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+const optionalString = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 
 export class AuthController {
   static async register(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
       const { username, email, password, displayName, avatar, gender, bio } = req.body;
 
-      if (!username || !email || !password || !displayName) {
+      if (
+        !isNonEmptyString(username) ||
+        !isNonEmptyString(email) ||
+        !isNonEmptyString(password) ||
+        !isNonEmptyString(displayName)
+      ) {
         res.status(400).json({
           success: false,
           message: 'Username, email, password, and display name are required',
@@ -37,9 +46,9 @@ export class AuthController {
         email,
         password,
         displayName,
-        avatar,
-        gender,
-        bio,
+        avatar: optionalString(avatar),
+        gender: optionalString(gender),
+        bio: optionalString(bio),
       });
 
       res.status(201).json({
@@ -59,7 +68,7 @@ export class AuthController {
     try {
       const { email, password } = req.body;
 
-      if (!email || !password) {
+      if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
         res.status(400).json({
           success: false,
           message: 'Email and password are required',
@@ -84,12 +93,13 @@ export class AuthController {
 
   static async logout(req: AuthenticatedRequest, res: Response): Promise<void> {
     try {
-      const { refreshToken } = req.body;
-      const userId = req.user?._id?.toString();
+      const refreshToken = optionalString(req.body?.refreshToken);
+      // Access token is optional: an expired access token must not prevent logout
+      const authHeader = req.headers.authorization;
+      const accessPayload =
+        authHeader && authHeader.startsWith('Bearer ') ? verifyAccessToken(authHeader.slice(7)) : null;
 
-      if (userId) {
-        await AuthService.logout(userId, refreshToken);
-      }
+      await AuthService.logout(refreshToken, accessPayload?.userId);
 
       res.status(200).json({
         success: true,
@@ -107,7 +117,7 @@ export class AuthController {
     try {
       const { refreshToken } = req.body;
 
-      if (!refreshToken) {
+      if (!isNonEmptyString(refreshToken)) {
         res.status(400).json({
           success: false,
           message: 'Refresh token is required',
@@ -134,7 +144,7 @@ export class AuthController {
     try {
       const { email } = req.body;
 
-      if (!email) {
+      if (!isNonEmptyString(email)) {
         res.status(400).json({
           success: false,
           message: 'Email is required',
@@ -147,12 +157,13 @@ export class AuthController {
       res.status(200).json({
         success: true,
         message: result.message,
-        resetToken: result.resetToken,
+        ...(result.resetToken ? { resetToken: result.resetToken } : {}),
       });
     } catch (err: any) {
+      console.error('[Auth] forgot-password error:', err);
       res.status(500).json({
         success: false,
-        message: err.message || 'Failed to process forgot password request',
+        message: 'Failed to process forgot password request',
       });
     }
   }
@@ -161,7 +172,7 @@ export class AuthController {
     try {
       const { resetToken, newPassword } = req.body;
 
-      if (!resetToken || !newPassword) {
+      if (!isNonEmptyString(resetToken) || !isNonEmptyString(newPassword)) {
         res.status(400).json({
           success: false,
           message: 'Reset token and new password are required',

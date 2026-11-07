@@ -1,6 +1,13 @@
 import crypto from 'crypto';
 import { User, IUser } from '../../models/User';
-import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../../utils/jwt';
+import {
+  signAccessToken,
+  signRefreshToken,
+  verifyRefreshToken,
+  hashToken,
+} from '../../utils/jwt';
+import { config } from '../../config';
+import { isMailConfigured, sendPasswordResetEmail } from '../../utils/mailer';
 
 export interface RegisterDTO {
   username: string;
@@ -23,41 +30,65 @@ export interface AuthResponse {
   user: ReturnType<IUser['toSafeUser']>;
 }
 
+const MAX_SESSIONS = 5;
+const FORGOT_PASSWORD_MESSAGE =
+  'If that email is registered, password reset instructions have been sent.';
+
+export const isSafeHttpUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+const issueSession = async (user: IUser): Promise<{ accessToken: string; refreshToken: string }> => {
+  const accessToken = signAccessToken(user._id.toString());
+  const refreshToken = signRefreshToken(user._id.toString());
+  // Keep the most recent sessions (multi-device), stored hashed
+  user.refreshTokens = [...(user.refreshTokens || []).slice(-(MAX_SESSIONS - 1)), hashToken(refreshToken)];
+  return { accessToken, refreshToken };
+};
+
 export class AuthService {
   static async register(dto: RegisterDTO): Promise<AuthResponse> {
-    const existingEmail = await User.findOne({ email: dto.email.toLowerCase().trim() });
+    const email = dto.email.toLowerCase().trim();
+    const username = dto.username.toLowerCase().trim();
+
+    if (!/^[a-z0-9_.]{3,30}$/.test(username)) {
+      throw new Error('Username must be 3-30 characters: letters, numbers, underscores or dots');
+    }
+
+    const existingEmail = await User.findOne({ email });
     if (existingEmail) {
       throw new Error('An account with this email already exists');
     }
 
-    const existingUsername = await User.findOne({ username: dto.username.toLowerCase().trim() });
+    const existingUsername = await User.findOne({ username });
     if (existingUsername) {
       throw new Error('This username is already taken');
     }
 
+    if (dto.avatar && !isSafeHttpUrl(dto.avatar)) {
+      throw new Error('Avatar must be an http(s) URL');
+    }
+
     const user = new User({
-      username: dto.username.toLowerCase().trim(),
-      email: dto.email.toLowerCase().trim(),
+      username,
+      email,
       password: dto.password,
       displayName: dto.displayName.trim(),
-      avatar: dto.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(dto.username)}`,
+      avatar: dto.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(username)}`,
       gender: dto.gender || 'prefer-not-to-say',
       bio: dto.bio || '',
-      isOnline: true,
       lastSeen: new Date(),
     });
 
-    const accessToken = signAccessToken(user._id.toString());
-    const refreshToken = signRefreshToken(user._id.toString());
-
-    user.refreshTokens = [refreshToken];
+    const tokens = await issueSession(user);
     await user.save();
 
-    return {
-      accessToken,
-      refreshToken,
-      user: user.toSafeUser(),
-    };
+    return { ...tokens, user: user.toSafeUser() };
   }
 
   static async login(dto: LoginDTO): Promise<AuthResponse> {
@@ -71,32 +102,28 @@ export class AuthService {
       throw new Error('Invalid email or password');
     }
 
-    const accessToken = signAccessToken(user._id.toString());
-    const refreshToken = signRefreshToken(user._id.toString());
-
-    // Keep up to 5 refresh tokens to support multi-device
-    user.refreshTokens = [...(user.refreshTokens || []).slice(-4), refreshToken];
-    user.isOnline = true;
+    const tokens = await issueSession(user);
     user.lastSeen = new Date();
     await user.save();
 
-    return {
-      accessToken,
-      refreshToken,
-      user: user.toSafeUser(),
-    };
+    return { ...tokens, user: user.toSafeUser() };
   }
 
-  static async logout(userId: string, refreshToken?: string): Promise<void> {
-    const user = await User.findById(userId);
-    if (!user) return;
-
+  /**
+   * Revokes a session. Works with only the refresh token, so clients can log out
+   * even after their short-lived access token has expired.
+   */
+  static async logout(refreshToken?: string, userIdFromAccessToken?: string): Promise<void> {
     if (refreshToken) {
-      user.refreshTokens = user.refreshTokens.filter((token) => token !== refreshToken);
-    } else {
-      user.refreshTokens = [];
+      const payload = verifyRefreshToken(refreshToken);
+      const userId = payload?.userId || userIdFromAccessToken;
+      if (!userId) return;
+      await User.updateOne({ _id: userId }, { $pull: { refreshTokens: hashToken(refreshToken) } });
+      return;
     }
-    await user.save();
+    if (userIdFromAccessToken) {
+      await User.updateOne({ _id: userIdFromAccessToken }, { $set: { refreshTokens: [] } });
+    }
   }
 
   static async refreshToken(oldRefreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
@@ -106,47 +133,55 @@ export class AuthService {
     }
 
     const user = await User.findById(payload.userId);
-    if (!user || !user.refreshTokens.includes(oldRefreshToken)) {
+    const oldHash = hashToken(oldRefreshToken);
+    if (!user || !user.refreshTokens.includes(oldHash)) {
       throw new Error('Refresh token revoked or invalid');
     }
 
     // Token rotation
-    const newAccessToken = signAccessToken(user._id.toString());
-    const newRefreshToken = signRefreshToken(user._id.toString());
-
-    user.refreshTokens = user.refreshTokens.filter((token) => token !== oldRefreshToken);
-    user.refreshTokens.push(newRefreshToken);
+    user.refreshTokens = user.refreshTokens.filter((token) => token !== oldHash);
+    const tokens = await issueSession(user);
     await user.save();
 
-    return {
-      accessToken: newAccessToken,
-      refreshToken: newRefreshToken,
-    };
+    return tokens;
   }
 
   static async forgotPassword(email: string): Promise<{ message: string; resetToken?: string }> {
     const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
-      // Return vague message for security, but return token if dev environment
-      return { message: 'If that email is registered, password reset instructions have been generated.' };
+      // Same response whether or not the account exists (no account enumeration)
+      return { message: FORGOT_PASSWORD_MESSAGE };
     }
 
     const resetToken = crypto.randomBytes(32).toString('hex');
-    user.resetPasswordToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+    user.resetPasswordToken = hashToken(resetToken);
     user.resetPasswordExpires = new Date(Date.now() + 3600000); // 1 hour
     await user.save();
 
-    return {
-      message: 'Password reset token generated successfully. In production this is sent via email.',
-      resetToken, // Returned so frontend user can test reset immediately
-    };
+    if (isMailConfigured()) {
+      try {
+        await sendPasswordResetEmail(user.email, resetToken);
+      } catch (err: any) {
+        console.error('[Auth] Failed to send password reset email:', err.message);
+      }
+    } else if (config.isProduction) {
+      console.error('[Auth] Password reset requested but SMTP is not configured (set SMTP_HOST etc).');
+    }
+
+    // The raw token is only ever returned to the client in development builds.
+    if (config.exposeResetTokenInResponse) {
+      return {
+        message: 'Development mode: reset token returned directly (in production it is emailed).',
+        resetToken,
+      };
+    }
+
+    return { message: FORGOT_PASSWORD_MESSAGE };
   }
 
   static async resetPassword(resetToken: string, newPassword: string): Promise<{ message: string }> {
-    const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-
     const user = await User.findOne({
-      resetPasswordToken: hashedToken,
+      resetPasswordToken: hashToken(resetToken),
       resetPasswordExpires: { $gt: new Date() },
     });
 

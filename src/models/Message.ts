@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema, Model } from 'mongoose';
+import { jsonOptions } from './serialize';
 
 export type MessageType = 'text' | 'image' | 'audio' | 'video' | 'call_log';
 export type MessageStatus = 'sent' | 'delivered' | 'read';
@@ -53,6 +54,7 @@ const MessageSchema = new Schema<IMessage>(
   },
   {
     timestamps: true,
+    toJSON: jsonOptions,
   }
 );
 

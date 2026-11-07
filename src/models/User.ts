@@ -1,5 +1,6 @@
 import mongoose, { Document, Schema, Model } from 'mongoose';
 import bcrypt from 'bcryptjs';
+import { jsonOptions } from './serialize';
 
 export interface IUser extends Document {
   _id: mongoose.Types.ObjectId;
@@ -91,6 +92,7 @@ const UserSchema = new Schema<IUser>(
   },
   {
     timestamps: true,
+    toJSON: jsonOptions,
   }
 );
 
