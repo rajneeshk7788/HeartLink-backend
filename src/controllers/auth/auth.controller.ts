@@ -212,7 +212,7 @@ export class AuthController {
         return;
       }
 
-      const user = await AuthService.getMe(req.user._id.toString());
+      const user = await AuthService.getMe(req.user.id);
 
       res.status(200).json({
         success: true,

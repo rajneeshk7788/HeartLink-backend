@@ -7,13 +7,13 @@ import { expressMiddleware } from '@apollo/server/express4';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 
 import { config, isOriginAllowed } from './config';
-import { connectDB, disconnectDB } from './config/db';
+import { connectDB, disconnectDB } from './db';
 import authRoutes from './routes/auth.routes';
 import { typeDefs } from './graphql/schema/typeDefs';
 import { resolvers, GraphQLContext } from './graphql/resolvers';
 import { getContextUserFromToken } from './middleware/auth.middleware';
 import { verifyAccessToken } from './utils/jwt';
-import { User } from './models/User';
+import { UserService } from './services/user/user.service';
 import { setIO } from './sockets/socketManager';
 import { registerPresenceHandlers } from './sockets/presence.socket';
 import { registerChatHandlers } from './sockets/chat.socket';
@@ -151,13 +151,13 @@ async function startServer() {
         return next(new Error('Invalid or expired socket authentication token'));
       }
 
-      const user = await User.findById(payload.userId);
+      const user = await UserService.findById(payload.userId);
       if (!user) {
         return next(new Error('User not found'));
       }
 
-      socket.data.userId = user._id.toString();
-      socket.data.user = user.toSafeUser();
+      socket.data.userId = user.id;
+      socket.data.user = user;
       next();
     } catch (err: any) {
       next(new Error(`Socket authentication error: ${err.message}`));
@@ -182,7 +182,7 @@ async function startServer() {
   await connectDB();
 
   // Nobody is connected right after a (re)start: clear stale presence flags
-  await User.updateMany({ isOnline: true }, { $set: { isOnline: false } });
+  await UserService.resetAllPresence();
 
   if (config.seedDemoData) {
     const { seedInitialData } = await import('./utils/seed');

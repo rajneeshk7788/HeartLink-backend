@@ -1,106 +1,118 @@
-import mongoose from 'mongoose';
-import { Conversation, IConversation } from '../../models/Conversation';
-import { Message, IMessage, MessageType } from '../../models/Message';
-import { User } from '../../models/User';
-import { USER_PUBLIC_FIELDS } from '../../models/serialize';
+import { query, queryOne, withTransaction, Tx } from '../../db';
+import {
+  Conversation,
+  Message,
+  MessageType,
+  isValidId,
+  conversationColumns,
+  messageColumns,
+} from '../../models/types';
 
 export const MAX_MESSAGE_LENGTH = 5000;
 const MAX_PAGE_SIZE = 100;
 const MESSAGE_TYPES: MessageType[] = ['text', 'image', 'audio', 'video', 'call_log'];
+const ACCESS_DENIED = 'Conversation not found or access denied';
 
-const isValidId = (id: string): boolean => mongoose.Types.ObjectId.isValid(id);
+const fetchMessage = async (db: Tx | null, messageId: string): Promise<Message | null> => {
+  const sql = `SELECT ${messageColumns('m', 's')} FROM messages m JOIN users s ON s.id = m.sender_id WHERE m.id = $1`;
+  if (db) {
+    const { rows } = await db.query(sql, [messageId]);
+    return rows[0] ?? null;
+  }
+  return queryOne<Message>(sql, [messageId]);
+};
 
-const conversationPopulate = [
-  { path: 'participants', select: USER_PUBLIC_FIELDS },
-  {
-    path: 'lastMessage',
-    populate: { path: 'sender', select: USER_PUBLIC_FIELDS },
-  },
-];
+const fetchConversation = async (conversationId: string): Promise<Conversation | null> =>
+  queryOne<Conversation>(`SELECT ${conversationColumns('c')} FROM conversations c WHERE c.id = $1`, [conversationId]);
 
 export class MessageService {
   /** Throws unless `userId` is a participant of the conversation. */
-  static async assertParticipant(conversationId: string, userId: string): Promise<IConversation> {
-    if (!isValidId(conversationId)) {
-      throw new Error('Conversation not found or access denied');
+  static async assertParticipant(conversationId: string, userId: string): Promise<void> {
+    if (!(await MessageService.isParticipant(conversationId, userId))) {
+      throw new Error(ACCESS_DENIED);
     }
-    const conversation = await Conversation.findOne({ _id: conversationId, participants: userId });
-    if (!conversation) {
-      throw new Error('Conversation not found or access denied');
-    }
-    return conversation;
   }
 
   static async isParticipant(conversationId: string, userId: string): Promise<boolean> {
-    if (!isValidId(conversationId)) return false;
-    return !!(await Conversation.exists({ _id: conversationId, participants: userId }));
+    if (!isValidId(conversationId) || !isValidId(userId)) return false;
+    return !!(await queryOne(
+      'SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2',
+      [conversationId, userId]
+    ));
   }
 
-  static async getConversations(userId: string): Promise<IConversation[]> {
-    return Conversation.find({ participants: userId })
-      .populate(conversationPopulate)
-      .sort({ updatedAt: -1 });
+  static async getParticipantIds(conversationId: string): Promise<string[]> {
+    if (!isValidId(conversationId)) return [];
+    const rows = await query<{ user_id: string }>(
+      'SELECT user_id::text AS user_id FROM conversation_participants WHERE conversation_id = $1',
+      [conversationId]
+    );
+    return rows.map((r) => r.user_id);
   }
 
-  static async getConversation(conversationId: string, userId: string): Promise<IConversation | null> {
-    if (!isValidId(conversationId)) return null;
-    return Conversation.findOne({
-      _id: conversationId,
-      participants: userId,
-    }).populate(conversationPopulate);
+  static async getConversations(userId: string): Promise<Conversation[]> {
+    return query<Conversation>(
+      `SELECT ${conversationColumns('c')}
+         FROM conversations c
+         JOIN conversation_participants me ON me.conversation_id = c.id AND me.user_id = $1
+        ORDER BY c.updated_at DESC`,
+      [userId]
+    );
   }
 
-  static async createConversation(currentUserId: string, participantId: string): Promise<IConversation> {
+  static async getConversation(conversationId: string, userId: string): Promise<Conversation | null> {
+    if (!(await MessageService.isParticipant(conversationId, userId))) return null;
+    return fetchConversation(conversationId);
+  }
+
+  static async createConversation(currentUserId: string, participantId: string): Promise<Conversation> {
     if (currentUserId === participantId) {
       throw new Error('Cannot create conversation with yourself');
     }
-    if (!isValidId(participantId)) {
+    if (!isValidId(participantId) || !(await queryOne('SELECT 1 FROM users WHERE id = $1', [participantId]))) {
       throw new Error('Participant not found');
     }
 
-    const participantExists = await User.exists({ _id: participantId });
-    if (!participantExists) {
-      throw new Error('Participant not found');
-    }
-
-    // Check if 1-on-1 conversation already exists
-    const existing = await Conversation.findOne({
-      participants: { $all: [currentUserId, participantId], $size: 2 },
-    }).populate(conversationPopulate);
-
-    if (existing) {
-      return existing;
-    }
-
-    const conversation = new Conversation({
-      participants: [currentUserId, participantId],
-      unreadCounts: [
-        { userId: currentUserId, count: 0 },
-        { userId: participantId, count: 0 },
-      ],
+    // One 1-on-1 conversation per pair, enforced by a unique key (safe against double taps / races)
+    const directKey = [currentUserId, participantId].sort().join(':');
+    const conversationId = await withTransaction(async (tx) => {
+      const inserted = await tx.query(
+        `INSERT INTO conversations (direct_key) VALUES ($1)
+         ON CONFLICT (direct_key) DO NOTHING RETURNING id::text AS id`,
+        [directKey]
+      );
+      if (inserted.rows.length > 0) {
+        const id: string = inserted.rows[0].id;
+        await tx.query(
+          `INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)`,
+          [id, currentUserId, participantId]
+        );
+        return id;
+      }
+      const existing = await tx.query('SELECT id::text AS id FROM conversations WHERE direct_key = $1', [directKey]);
+      return existing.rows[0].id as string;
     });
 
-    await conversation.save();
-    return conversation.populate(conversationPopulate);
+    return (await fetchConversation(conversationId))!;
   }
 
-  static async getMessages(
-    conversationId: string,
-    userId: string,
-    limit = 50,
-    offset = 0
-  ): Promise<IMessage[]> {
+  static async getMessages(conversationId: string, userId: string, limit = 50, offset = 0): Promise<Message[]> {
     await MessageService.assertParticipant(conversationId, userId);
 
     const safeLimit = Math.min(Math.max(1, Math.floor(limit) || 50), MAX_PAGE_SIZE);
     const safeOffset = Math.max(0, Math.floor(offset) || 0);
 
-    const msgs = await Message.find({ conversationId })
-      .sort({ createdAt: -1 })
-      .skip(safeOffset)
-      .limit(safeLimit)
-      .populate('sender', USER_PUBLIC_FIELDS);
-    return msgs.reverse(); // chronological order
+    // Newest page first, returned in chronological order
+    return query<Message>(
+      `SELECT * FROM (
+         SELECT ${messageColumns('m', 's')}
+           FROM messages m JOIN users s ON s.id = m.sender_id
+          WHERE m.conversation_id = $1
+          ORDER BY m.created_at DESC, m.id DESC
+          LIMIT $2 OFFSET $3
+       ) page ORDER BY "createdAt" ASC, id ASC`,
+      [conversationId, safeLimit, safeOffset]
+    );
   }
 
   static async sendMessage(
@@ -108,7 +120,7 @@ export class MessageService {
     conversationId: string,
     content: string,
     type: MessageType = 'text'
-  ): Promise<{ message: IMessage; participantIds: string[] }> {
+  ): Promise<{ message: Message; participantIds: string[] }> {
     const trimmed = (content || '').trim();
     if (!trimmed) {
       throw new Error('Message content cannot be empty');
@@ -119,106 +131,99 @@ export class MessageService {
     if (!MESSAGE_TYPES.includes(type)) {
       throw new Error('Invalid message type');
     }
+    await MessageService.assertParticipant(conversationId, senderId);
 
-    const conversation = await MessageService.assertParticipant(conversationId, senderId);
-
-    const message = new Message({
-      conversationId,
-      sender: senderId,
-      content: trimmed,
-      type,
-      readBy: [senderId],
-      status: 'sent',
+    const message = await withTransaction(async (tx) => {
+      const { rows } = await tx.query(
+        `INSERT INTO messages (conversation_id, sender_id, content, type) VALUES ($1, $2, $3, $4)
+         RETURNING id::text AS id`,
+        [conversationId, senderId, trimmed, type]
+      );
+      const messageId: string = rows[0].id;
+      // The sender has "read" their own message
+      await tx.query('INSERT INTO message_reads (message_id, user_id) VALUES ($1, $2)', [messageId, senderId]);
+      await tx.query('UPDATE conversations SET last_message_id = $2, updated_at = now() WHERE id = $1', [
+        conversationId,
+        messageId,
+      ]);
+      await tx.query(
+        `UPDATE conversation_participants SET unread_count = unread_count + 1
+          WHERE conversation_id = $1 AND user_id <> $2`,
+        [conversationId, senderId]
+      );
+      return (await fetchMessage(tx, messageId))!;
     });
 
-    await message.save();
-
-    // Update conversation lastMessage & increment unread for other participants
-    conversation.lastMessage = message._id;
-    conversation.unreadCounts.forEach((uc) => {
-      if (uc.userId.toString() !== senderId) {
-        uc.count = (uc.count || 0) + 1;
-      }
-    });
-    conversation.markModified('unreadCounts');
-    await conversation.save();
-
-    await message.populate('sender', USER_PUBLIC_FIELDS);
-    return {
-      message,
-      participantIds: conversation.participants.map((p) => p.toString()),
-    };
+    return { message, participantIds: await MessageService.getParticipantIds(conversationId) };
   }
 
-  static async markMessageAsRead(messageId: string, userId: string): Promise<IMessage> {
+  private static async recalculateUnread(tx: Tx, conversationId: string, userId: string): Promise<void> {
+    await tx.query(
+      `UPDATE conversation_participants cp
+          SET unread_count = (
+            SELECT count(*) FROM messages m
+             WHERE m.conversation_id = $1 AND m.sender_id <> $2
+               AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id = m.id AND r.user_id = $2))
+        WHERE cp.conversation_id = $1 AND cp.user_id = $2`,
+      [conversationId, userId]
+    );
+  }
+
+  static async markMessageAsRead(messageId: string, userId: string): Promise<Message> {
     if (!isValidId(messageId)) {
       throw new Error('Message not found');
     }
-    const message = await Message.findById(messageId);
-    if (!message) {
+    const msg = await queryOne<{ conversation_id: string; sender_id: string }>(
+      'SELECT conversation_id::text AS conversation_id, sender_id::text AS sender_id FROM messages WHERE id = $1',
+      [messageId]
+    );
+    if (!msg) {
       throw new Error('Message not found');
     }
+    await MessageService.assertParticipant(msg.conversation_id, userId);
 
-    await MessageService.assertParticipant(message.conversationId.toString(), userId);
-
-    const hasRead = message.readBy.some((id) => id.toString() === userId);
-    if (!hasRead) {
-      message.readBy.push(new mongoose.Types.ObjectId(userId));
-      if (message.sender.toString() !== userId) {
-        message.status = 'read';
+    return withTransaction(async (tx) => {
+      await tx.query(
+        'INSERT INTO message_reads (message_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [messageId, userId]
+      );
+      if (msg.sender_id !== userId) {
+        await tx.query(`UPDATE messages SET status = 'read', updated_at = now() WHERE id = $1`, [messageId]);
       }
-      await message.save();
-    }
-
-    await MessageService.recalculateUnread(message.conversationId.toString(), userId);
-
-    return message.populate('sender', USER_PUBLIC_FIELDS);
+      await MessageService.recalculateUnread(tx, msg.conversation_id, userId);
+      return (await fetchMessage(tx, messageId))!;
+    });
   }
 
   /** Marks every message from other participants as read and resets the user's unread counter. */
   static async markConversationAsRead(
     conversationId: string,
     userId: string
-  ): Promise<{ conversation: IConversation; messageIds: string[] }> {
-    const conversation = await MessageService.assertParticipant(conversationId, userId);
-    const userObjectId = new mongoose.Types.ObjectId(userId);
+  ): Promise<{ conversation: Conversation; messageIds: string[] }> {
+    await MessageService.assertParticipant(conversationId, userId);
 
-    const unread = await Message.find(
-      { conversationId, sender: { $ne: userObjectId }, readBy: { $ne: userObjectId } },
-      { _id: 1 }
-    );
-    const messageIds = unread.map((m) => m._id);
-
-    if (messageIds.length > 0) {
-      await Message.updateMany(
-        { _id: { $in: messageIds } },
-        { $addToSet: { readBy: userObjectId }, $set: { status: 'read' } }
+    const messageIds = await withTransaction(async (tx) => {
+      const { rows } = await tx.query(
+        `INSERT INTO message_reads (message_id, user_id)
+         SELECT m.id, $2 FROM messages m
+          WHERE m.conversation_id = $1 AND m.sender_id <> $2
+            AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id = m.id AND r.user_id = $2)
+         ON CONFLICT DO NOTHING
+         RETURNING message_id::text AS id`,
+        [conversationId, userId]
       );
-    }
-
-    await Conversation.updateOne(
-      { _id: conversationId, 'unreadCounts.userId': userObjectId },
-      { $set: { 'unreadCounts.$.count': 0 } }
-    );
-
-    const refreshed = await Conversation.findById(conversation._id).populate(conversationPopulate);
-    return {
-      conversation: refreshed || conversation,
-      messageIds: messageIds.map((id) => id.toString()),
-    };
-  }
-
-  private static async recalculateUnread(conversationId: string, userId: string): Promise<void> {
-    const userObjectId = new mongoose.Types.ObjectId(userId);
-    const remaining = await Message.countDocuments({
-      conversationId,
-      sender: { $ne: userObjectId },
-      readBy: { $ne: userObjectId },
+      const ids: string[] = rows.map((r: { id: string }) => r.id);
+      if (ids.length > 0) {
+        await tx.query(`UPDATE messages SET status = 'read', updated_at = now() WHERE id = ANY($1::uuid[])`, [ids]);
+      }
+      await tx.query(
+        'UPDATE conversation_participants SET unread_count = 0 WHERE conversation_id = $1 AND user_id = $2',
+        [conversationId, userId]
+      );
+      return ids;
     });
-    await Conversation.updateOne(
-      { _id: conversationId, 'unreadCounts.userId': userObjectId },
-      { $set: { 'unreadCounts.$.count': remaining } }
-    );
+
+    return { conversation: (await fetchConversation(conversationId))!, messageIds };
   }
 
   static async deleteMessage(
@@ -228,43 +233,42 @@ export class MessageService {
     if (!isValidId(messageId)) {
       throw new Error('Message not found');
     }
-    const message = await Message.findById(messageId);
-    if (!message) {
+    const msg = await queryOne<{ conversation_id: string; sender_id: string; read_by_others: boolean }>(
+      `SELECT m.conversation_id::text AS conversation_id, m.sender_id::text AS sender_id,
+              EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id = m.id AND r.user_id <> m.sender_id) AS read_by_others
+         FROM messages m WHERE m.id = $1`,
+      [messageId]
+    );
+    if (!msg) {
       throw new Error('Message not found');
     }
-
-    if (message.sender.toString() !== userId) {
+    if (msg.sender_id !== userId) {
       throw new Error('Not authorized to delete this message');
     }
 
-    const conversationId = message.conversationId.toString();
-    await Message.deleteOne({ _id: messageId });
-
-    const conversation = await Conversation.findById(conversationId);
-    if (!conversation) {
-      return { conversationId, participantIds: [] };
-    }
-
-    // Repoint lastMessage if the deleted message was the latest one
-    if (conversation.lastMessage?.toString() === messageId) {
-      const latest = await Message.findOne({ conversationId }).sort({ createdAt: -1 });
-      conversation.lastMessage = latest ? latest._id : undefined;
-    }
-
-    // If the other side had not read it yet, it should no longer count as unread
-    if (!message.readBy.some((id) => id.toString() !== userId)) {
-      conversation.unreadCounts.forEach((uc) => {
-        if (uc.userId.toString() !== userId && uc.count > 0) {
-          uc.count -= 1;
-        }
-      });
-      conversation.markModified('unreadCounts');
-    }
-    await conversation.save();
+    await withTransaction(async (tx) => {
+      await tx.query('DELETE FROM messages WHERE id = $1', [messageId]);
+      // If it was the latest message, point the conversation at the newest remaining one
+      await tx.query(
+        `UPDATE conversations c
+            SET last_message_id = (
+              SELECT m.id FROM messages m WHERE m.conversation_id = c.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1)
+          WHERE c.id = $1 AND (c.last_message_id IS NULL OR c.last_message_id = $2)`,
+        [msg.conversation_id, messageId]
+      );
+      // An unread message that disappears should no longer count as unread
+      if (!msg.read_by_others) {
+        await tx.query(
+          `UPDATE conversation_participants SET unread_count = GREATEST(unread_count - 1, 0)
+            WHERE conversation_id = $1 AND user_id <> $2`,
+          [msg.conversation_id, userId]
+        );
+      }
+    });
 
     return {
-      conversationId,
-      participantIds: conversation.participants.map((p) => p.toString()),
+      conversationId: msg.conversation_id,
+      participantIds: await MessageService.getParticipantIds(msg.conversation_id),
     };
   }
 }

@@ -1,6 +1,6 @@
 # Render Blueprint — https://render.com/docs/blueprint-spec
-# In Render: New + → Blueprint → paste this repo's URL. Render reads this file,
-# generates the JWT secrets and asks you only for the values marked `sync: false`.
+# In Render: New + → Blueprint → paste this repo's URL. Render creates the PostgreSQL
+# database and the web service, wires DATABASE_URL between them and generates the JWT secrets.
 # Deploys are driven by GitHub Actions (.github/workflows/deploy.yml) through the
 # service's Deploy Hook, after the tests pass — not by Render auto-deploy.
 services:
@@ -21,9 +21,6 @@ services:
         value: production
       - key: NODE_VERSION
         value: "22"
-      # Skip downloading the local-dev MongoDB binary during the build
-      - key: MONGOMS_DISABLE_POSTINSTALL
-        value: "1"
       # Login token signing keys (random, generated once by Render)
       - key: JWT_SECRET
         generateValue: true
@@ -33,9 +30,11 @@ services:
         value: 15m
       - key: JWT_REFRESH_EXPIRES_IN
         value: 7d
-      # MongoDB Atlas connection string — paste it in the Render dashboard (never commit it)
-      - key: MONGODB_URI
-        sync: false
+      # PostgreSQL connection string, filled in automatically from the database below
+      - key: DATABASE_URL
+        fromDatabase:
+          name: heartlink-db
+          property: connectionString
       # Allowed browser origins for the web app (comma-separated). The Android app
       # does not need this. Leave as-is until the web frontend is hosted.
       - key: CLIENT_URL
@@ -54,3 +53,13 @@ services:
         sync: false
       - key: SMTP_FROM
         sync: false
+
+databases:
+  - name: heartlink-db
+    databaseName: heartlink
+    user: heartlink
+    plan: free
+    region: singapore
+    postgresMajorVersion: "17"
+    # Only the web service connects (over Render's private network)
+    ipAllowList: []

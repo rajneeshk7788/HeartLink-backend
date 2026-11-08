@@ -3,13 +3,13 @@ import { UserService } from '../../services/user/user.service';
 import { MessageService } from '../../services/message/message.service';
 import { CallService } from '../../services/call/call.service';
 import { emitToUser, emitToUsers, isUserOnline } from '../../sockets/socketManager';
-import { IUser } from '../../models/User';
+import { User } from '../../models/types';
 
 export interface GraphQLContext {
-  user: IUser | null;
+  user: User | null;
 }
 
-const checkAuth = (context: GraphQLContext): IUser => {
+const checkAuth = (context: GraphQLContext): User => {
   if (!context.user) {
     throw new GraphQLError('Authentication required for this operation', {
       extensions: { code: 'UNAUTHENTICATED' },
@@ -34,7 +34,7 @@ const run = async <T>(fn: () => Promise<T>): Promise<T> => {
   }
 };
 
-const idOf = (parent: any): string => parent?._id?.toString() || parent?.id;
+const idOf = (parent: any): string => String(parent?.id);
 
 const toISO = (value: any): string | null => {
   if (!value) return null;
@@ -44,14 +44,15 @@ const toISO = (value: any): string | null => {
 // Non-null timestamp fields fall back to "now" rather than crashing on partial documents
 const toISORequired = (value: any): string => toISO(value) || new Date().toISOString();
 
-const serialize = (doc: any) => (doc && typeof doc.toJSON === 'function' ? doc.toJSON() : doc);
+/** Plain JSON copy for socket payloads (Dates become ISO strings). */
+const serialize = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 
 export const resolvers = {
   User: {
     id: idOf,
     // Email is private: only returned on the requesting user's own record
     email: (parent: any, _: any, context: GraphQLContext) =>
-      context.user && idOf(parent) === context.user._id.toString() ? parent.email || null : null,
+      context.user && idOf(parent) === context.user.id ? parent.email || null : null,
     isOnline: (parent: any) => isUserOnline(idOf(parent)),
     createdAt: (parent: any) => toISORequired(parent.createdAt),
     updatedAt: (parent: any) => toISORequired(parent.updatedAt),
@@ -91,7 +92,7 @@ export const resolvers = {
 
     SearchUsers: async (_: any, { query }: { query?: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return run(() => UserService.searchUsers(query || '', user._id.toString()));
+      return run(() => UserService.searchUsers(query || '', user.id));
     },
 
     GetUserProfile: async (_: any, { userId }: { userId: string }, context: GraphQLContext) => {
@@ -105,12 +106,12 @@ export const resolvers = {
 
     GetConversations: async (_: any, __: any, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return run(() => MessageService.getConversations(user._id.toString()));
+      return run(() => MessageService.getConversations(user.id));
     },
 
     GetConversation: async (_: any, { conversationId }: { conversationId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      const conversation = await MessageService.getConversation(conversationId, user._id.toString());
+      const conversation = await MessageService.getConversation(conversationId, user.id);
       if (!conversation) {
         throw new GraphQLError('Conversation not found or access denied', {
           extensions: { code: 'NOT_FOUND' },
@@ -126,26 +127,26 @@ export const resolvers = {
     ) => {
       const user = checkAuth(context);
       return run(() =>
-        MessageService.getMessages(conversationId, user._id.toString(), limit ?? 50, offset ?? 0)
+        MessageService.getMessages(conversationId, user.id, limit ?? 50, offset ?? 0)
       );
     },
 
     GetCallHistory: async (_: any, __: any, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return run(() => CallService.getCallHistory(user._id.toString()));
+      return run(() => CallService.getCallHistory(user.id));
     },
   },
 
   Mutation: {
     UpdateProfile: async (_: any, { input }: { input: any }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      return run(() => UserService.updateProfile(user._id.toString(), input || {}));
+      return run(() => UserService.updateProfile(user.id, input || {}));
     },
 
     CreateConversation: async (_: any, { participantId }: { participantId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
       const conversation = await run(() =>
-        MessageService.createConversation(user._id.toString(), participantId)
+        MessageService.createConversation(user.id, participantId)
       );
 
       // Notify the participant that a conversation is available
@@ -161,7 +162,7 @@ export const resolvers = {
     ) => {
       const user = checkAuth(context);
       const { message, participantIds } = await run(() =>
-        MessageService.sendMessage(user._id.toString(), conversationId, content, type || 'text')
+        MessageService.sendMessage(user.id, conversationId, content, type || 'text')
       );
 
       // Deliver to every device of every participant (chat list + open chat both update)
@@ -172,21 +173,14 @@ export const resolvers = {
 
     MarkMessageAsRead: async (_: any, { messageId }: { messageId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
-      const message = await run(() => MessageService.markMessageAsRead(messageId, user._id.toString()));
-      const conversation = await MessageService.getConversation(
-        message.conversationId.toString(),
-        user._id.toString()
-      );
+      const message = await run(() => MessageService.markMessageAsRead(messageId, user.id));
+      const participantIds = await MessageService.getParticipantIds(message.conversationId);
 
-      emitToUsers(
-        (conversation?.participants || []).map((p: any) => idOf(p)),
-        'message:read',
-        {
-          conversationId: message.conversationId.toString(),
-          messageId: message._id.toString(),
-          userId: user._id.toString(),
-        }
-      );
+      emitToUsers(participantIds, 'message:read', {
+        conversationId: message.conversationId,
+        messageId: message.id,
+        userId: user.id,
+      });
 
       return message;
     },
@@ -198,13 +192,13 @@ export const resolvers = {
     ) => {
       const user = checkAuth(context);
       const { conversation, messageIds } = await run(() =>
-        MessageService.markConversationAsRead(conversationId, user._id.toString())
+        MessageService.markConversationAsRead(conversationId, user.id)
       );
 
       emitToUsers(
         conversation.participants.map((p: any) => idOf(p)),
         'conversation:read',
-        { conversationId, userId: user._id.toString(), messageIds }
+        { conversationId, userId: user.id, messageIds }
       );
 
       return conversation;
@@ -213,7 +207,7 @@ export const resolvers = {
     DeleteMessage: async (_: any, { messageId }: { messageId: string }, context: GraphQLContext) => {
       const user = checkAuth(context);
       const { conversationId, participantIds } = await run(() =>
-        MessageService.deleteMessage(messageId, user._id.toString())
+        MessageService.deleteMessage(messageId, user.id)
       );
       emitToUsers(participantIds, 'message:deleted', { conversationId, messageId });
       return true;
@@ -223,7 +217,7 @@ export const resolvers = {
       const user = checkAuth(context);
       return run(() =>
         CallService.createCallRecord({
-          callerId: user._id.toString(),
+          callerId: user.id,
           receiverId: input.receiverId,
           callType: input.callType,
           conversationId: input.conversationId,
@@ -237,7 +231,7 @@ export const resolvers = {
       context: GraphQLContext
     ) => {
       const user = checkAuth(context);
-      return run(() => CallService.updateCallStatus(callId, status, duration, user._id.toString()));
+      return run(() => CallService.updateCallStatus(callId, status, duration, user.id));
     },
   },
 };

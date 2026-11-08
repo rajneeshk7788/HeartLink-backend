@@ -20,19 +20,19 @@ jobs:
     timeout-minutes: 15
 
     services:
-      mongo:
-        image: mongo:7
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: heartlink_ci
         ports:
-          - 27017:27017
+          - 5432:5432
         options: >-
-          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-
-    env:
-      # Skip downloading the local-dev MongoDB binary (CI uses the mongo service above)
-      MONGOMS_DISABLE_POSTINSTALL: '1'
 
     steps:
       - uses: actions/checkout@v4
@@ -51,11 +51,19 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Database migrations + connection check
+        env:
+          NODE_ENV: production
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/heartlink_ci
+          JWT_SECRET: ci-only-access-secret
+          JWT_REFRESH_SECRET: ci-only-refresh-secret
+        run: npm run db:check
+
       - name: Start server (production mode)
         env:
           NODE_ENV: production
           PORT: '5000'
-          MONGODB_URI: mongodb://localhost:27017/heartlink_ci
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/heartlink_ci
           JWT_SECRET: ci-only-access-secret
           JWT_REFRESH_SECRET: ci-only-refresh-secret
           SEED_DEMO_DATA: 'true'

@@ -1,5 +1,5 @@
 import { Server, Socket } from 'socket.io';
-import { User } from '../models/User';
+import { UserService } from '../services/user/user.service';
 import { onlineUsers, getOnlineUserIds } from './socketManager';
 
 export const registerPresenceHandlers = (io: Server, socket: Socket): void => {
@@ -20,9 +20,9 @@ export const registerPresenceHandlers = (io: Server, socket: Socket): void => {
   // If user just came online from 0 active connections
   if (wasOffline) {
     const now = new Date();
-    User.findByIdAndUpdate(userId, { isOnline: true, lastSeen: now })
-      .exec()
-      .catch((err) => console.error('[Presence] Failed to mark online:', err.message));
+    UserService.setPresence(userId, true).catch((err) =>
+      console.error('[Presence] Failed to mark online:', err.message)
+    );
     socket.broadcast.emit('user:online', {
       userId,
       isOnline: true,
@@ -52,7 +52,7 @@ export const registerPresenceHandlers = (io: Server, socket: Socket): void => {
       onlineUsers.delete(userId);
       const lastSeen = new Date();
       try {
-        await User.findByIdAndUpdate(userId, { isOnline: false, lastSeen }).exec();
+        await UserService.setPresence(userId, false);
       } catch (err: any) {
         console.error('[Presence] Failed to mark offline:', err.message);
       }

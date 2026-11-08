@@ -1,5 +1,4 @@
 import { Server, Socket } from 'socket.io';
-import { Conversation } from '../models/Conversation';
 import { MessageService } from '../services/message/message.service';
 
 const roomName = (conversationId: string) => `conversation:${conversationId}`;
@@ -17,9 +16,7 @@ export const registerChatHandlers = (io: Server, socket: Socket): void => {
     if (cached && Date.now() - cached.cachedAt < PARTICIPANT_CACHE_MS) return cached.others;
 
     if (!(await MessageService.isParticipant(conversationId, userId))) return null;
-    const conversation = await Conversation.findById(conversationId, { participants: 1 }).lean();
-    if (!conversation) return null;
-    const others = conversation.participants.map((p) => p.toString()).filter((id) => id !== userId);
+    const others = (await MessageService.getParticipantIds(conversationId)).filter((id) => id !== userId);
     participantCache.set(conversationId, { others, cachedAt: Date.now() });
     return others;
   };

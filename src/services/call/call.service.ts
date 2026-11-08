@@ -1,7 +1,5 @@
-import mongoose from 'mongoose';
-import { CallRecord, ICallRecord, CallType, CallStatus } from '../../models/CallRecord';
-import { User } from '../../models/User';
-import { USER_PUBLIC_FIELDS } from '../../models/serialize';
+import { query, queryOne } from '../../db';
+import { CallRecord, CallType, CallStatus, isValidId, callColumns } from '../../models/types';
 
 export interface CreateCallInput {
   callerId: string;
@@ -11,16 +9,22 @@ export interface CreateCallInput {
 }
 
 const CALL_TYPES: CallType[] = ['audio', 'video'];
+const CALL_STATUSES: CallStatus[] = ['initiated', 'ringing', 'accepted', 'rejected', 'missed', 'completed', 'busy'];
 const FINAL_STATUSES: CallStatus[] = ['completed', 'rejected', 'missed', 'busy'];
 
-const populateParties = [
-  { path: 'caller', select: USER_PUBLIC_FIELDS },
-  { path: 'receiver', select: USER_PUBLIC_FIELDS },
-];
+const fetchCall = (callId: string) =>
+  queryOne<CallRecord>(
+    `SELECT ${callColumns('cr', 'ca', 're')}
+       FROM call_records cr
+       JOIN users ca ON ca.id = cr.caller_id
+       JOIN users re ON re.id = cr.receiver_id
+      WHERE cr.id = $1`,
+    [callId]
+  );
 
 export class CallService {
-  static async createCallRecord(input: CreateCallInput): Promise<ICallRecord> {
-    if (!mongoose.Types.ObjectId.isValid(input.receiverId)) {
+  static async createCallRecord(input: CreateCallInput): Promise<CallRecord> {
+    if (!isValidId(input.receiverId)) {
       throw new Error('Receiver not found');
     }
     if (input.callerId === input.receiverId) {
@@ -29,24 +33,21 @@ export class CallService {
     if (!CALL_TYPES.includes(input.callType)) {
       throw new Error('Invalid call type');
     }
-    if (!(await User.exists({ _id: input.receiverId }))) {
+    if (!(await queryOne('SELECT 1 FROM users WHERE id = $1', [input.receiverId]))) {
       throw new Error('Receiver not found');
     }
+    const conversationId =
+      input.conversationId && isValidId(input.conversationId) &&
+      (await queryOne('SELECT 1 FROM conversations WHERE id = $1', [input.conversationId]))
+        ? input.conversationId
+        : null;
 
-    const callRecord = new CallRecord({
-      caller: input.callerId,
-      receiver: input.receiverId,
-      conversationId:
-        input.conversationId && mongoose.Types.ObjectId.isValid(input.conversationId)
-          ? input.conversationId
-          : null,
-      callType: input.callType,
-      status: 'initiated',
-      startedAt: new Date(),
-    });
-
-    await callRecord.save();
-    return callRecord.populate(populateParties);
+    const row = await queryOne<{ id: string }>(
+      `INSERT INTO call_records (caller_id, receiver_id, conversation_id, call_type, status, started_at)
+       VALUES ($1, $2, $3, $4, 'initiated', now()) RETURNING id::text AS id`,
+      [input.callerId, input.receiverId, conversationId, input.callType]
+    );
+    return (await fetchCall(row!.id))!;
   }
 
   /**
@@ -58,43 +59,49 @@ export class CallService {
     status: CallStatus,
     duration = 0,
     actingUserId?: string
-  ): Promise<ICallRecord> {
-    if (!mongoose.Types.ObjectId.isValid(callId)) {
+  ): Promise<CallRecord> {
+    if (!isValidId(callId)) {
       throw new Error('Call record not found');
     }
-    const callRecord = await CallRecord.findById(callId);
-    if (!callRecord) {
+    if (!CALL_STATUSES.includes(status)) {
+      throw new Error('Invalid call status');
+    }
+    const existing = await queryOne<{ caller_id: string; receiver_id: string }>(
+      'SELECT caller_id::text AS caller_id, receiver_id::text AS receiver_id FROM call_records WHERE id = $1',
+      [callId]
+    );
+    if (!existing) {
       throw new Error('Call record not found');
     }
-
-    if (
-      actingUserId &&
-      callRecord.caller.toString() !== actingUserId &&
-      callRecord.receiver.toString() !== actingUserId
-    ) {
+    if (actingUserId && existing.caller_id !== actingUserId && existing.receiver_id !== actingUserId) {
       throw new Error('Not authorized to update this call');
     }
 
-    callRecord.status = status;
-    if (status === 'accepted') {
-      // Duration is measured from the moment the call was answered
-      callRecord.startedAt = new Date();
-    }
-    if (FINAL_STATUSES.includes(status)) {
-      callRecord.endedAt = new Date();
-      callRecord.duration = status === 'completed' ? Math.max(0, Math.round(duration || 0)) : 0;
-    }
-
-    await callRecord.save();
-    return callRecord.populate(populateParties);
+    const isFinal = FINAL_STATUSES.includes(status);
+    await query(
+      `UPDATE call_records
+          SET status = $2,
+              -- duration is measured from the moment the call was answered
+              started_at = CASE WHEN $2 = 'accepted' THEN now() ELSE started_at END,
+              ended_at = CASE WHEN $3 THEN now() ELSE ended_at END,
+              duration = CASE WHEN $3 THEN $4 ELSE duration END,
+              updated_at = now()
+        WHERE id = $1`,
+      [callId, status, isFinal, status === 'completed' ? Math.max(0, Math.round(duration || 0)) : 0]
+    );
+    return (await fetchCall(callId))!;
   }
 
-  static async getCallHistory(userId: string): Promise<ICallRecord[]> {
-    return CallRecord.find({
-      $or: [{ caller: userId }, { receiver: userId }],
-    })
-      .populate(populateParties)
-      .sort({ createdAt: -1 })
-      .limit(50);
+  static async getCallHistory(userId: string): Promise<CallRecord[]> {
+    return query<CallRecord>(
+      `SELECT ${callColumns('cr', 'ca', 're')}
+         FROM call_records cr
+         JOIN users ca ON ca.id = cr.caller_id
+         JOIN users re ON re.id = cr.receiver_id
+        WHERE cr.caller_id = $1 OR cr.receiver_id = $1
+        ORDER BY cr.created_at DESC
+        LIMIT 50`,
+      [userId]
+    );
   }
 }

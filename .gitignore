@@ -41,3 +41,6 @@ Thumbs.db
 
 # Local development database (created automatically when MongoDB is not installed)
 .local-db/
+
+# Bundled PostgreSQL data (local development)
+.local-pg/

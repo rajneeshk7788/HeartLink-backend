@@ -1,6 +1,6 @@
 import { Server, Socket } from 'socket.io';
 import { CallService } from '../services/call/call.service';
-import { CallStatus, CallType } from '../models/CallRecord';
+import { CallStatus, CallType } from '../models/types';
 import { config } from '../config';
 import { isUserOnline } from './socketManager';
 
@@ -123,7 +123,7 @@ export const registerCallHandlers = (io: Server, socket: Socket): void => {
           callType,
           conversationId,
         });
-        const callId = callRecord._id.toString();
+        const callId = callRecord.id;
 
         if (!isUserOnline(receiverId)) {
           await CallService.updateCallStatus(callId, 'missed');
