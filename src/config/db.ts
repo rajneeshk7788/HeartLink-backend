@@ -54,7 +54,12 @@ export const connectDB = async (): Promise<void> => {
     console.log('[DB] Connected successfully to primary MongoDB instance.');
     return;
   } catch (primaryErr: any) {
-    console.warn(`\n[DB] ❌ Could not connect to primary MongoDB: ${primaryErr.message}`);
+    if (isLocal && config.allowInMemoryDbFallback && config.persistLocalDb) {
+      // Normal on a PC without MongoDB installed: not an error, we start our own below
+      console.log(`[DB] No MongoDB installed/running at ${host}:${port} (that's fine).`);
+    } else {
+      console.warn(`\n[DB] ❌ Could not connect to primary MongoDB: ${primaryErr.message}`);
+    }
     if (config.mongodbUri.includes('mongodb+srv://') || config.mongodbUri.includes('.mongodb.net')) {
       console.warn('[DB] 💡 Atlas Troubleshooting Checklist:');
       console.warn('  1. Network Access: Ensure your IP is whitelisted in MongoDB Atlas -> Network Access.');
@@ -74,7 +79,7 @@ export const connectDB = async (): Promise<void> => {
   try {
     let fallbackUri: string;
     if (isLocal && config.persistLocalDb) {
-      console.warn('[DB] No MongoDB server is running locally — starting a bundled local MongoDB...');
+      console.log('[DB] Starting the bundled local MongoDB (your data is kept between restarts)...');
       fallbackUri = await startLocalMongo(port, dbName);
     } else {
       console.warn('[DB] Launching temporary in-memory MongoDB (data is lost on restart)...');
