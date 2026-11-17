@@ -83,7 +83,8 @@ const waitFor = (socket, event, ms = 4000, pred = () => true) =>
 
   // ---- GraphQL authorization ----
   const convs = await gql(alice.accessToken, '{ GetConversations { id participants { id username email } } }');
-  const conv = convs.data.GetConversations[0];
+  // The seeded alice<->bob chat (a local database may hold other conversations too)
+  const conv = convs.data.GetConversations.find((c) => c.participants.some((p) => p.username === 'bob'));
   ok(!!conv, 'alice has the seeded conversation');
   ok(conv.participants.every((p) => p.email === null), 'emails hidden in participant lists');
   const me = await gql(alice.accessToken, '{ GetCurrentUser { email } SearchUsers(query:"bob") { email } }');
@@ -120,12 +121,13 @@ const waitFor = (socket, event, ms = 4000, pred = () => true) =>
   // Unread + mark read
   let bc = await gql(bob.accessToken, '{ GetConversations { id unreadCounts { userId count } } }');
   const bobId = bob.user.id;
-  const unread = bc.data.GetConversations[0].unreadCounts.find((u) => u.userId === bobId).count;
+  const bobConv = (list) => list.find((c) => c.id === conv.id);
+  const unread = bobConv(bc.data.GetConversations).unreadCounts.find((u) => u.userId === bobId).count;
   ok(unread === 1, 'bob has 1 unread');
   const aliceRead = waitFor(sa, 'conversation:read');
   await gql(bob.accessToken, 'mutation($c:ID!){ MarkConversationAsRead(conversationId:$c){ id } }', { c: conv.id });
   bc = await gql(bob.accessToken, '{ GetConversations { id unreadCounts { userId count } } }');
-  ok(bc.data.GetConversations[0].unreadCounts.find((u) => u.userId === bobId).count === 0, 'MarkConversationAsRead resets unread');
+  ok(bobConv(bc.data.GetConversations).unreadCounts.find((u) => u.userId === bobId).count === 0, 'MarkConversationAsRead resets unread');
   ok(!!(await aliceRead), 'alice is notified of the read receipt');
 
   // Typing reaches bob's user room without a room join; charlie's fake conversation id is ignored
@@ -138,8 +140,44 @@ const waitFor = (socket, event, ms = 4000, pred = () => true) =>
   const delEvt = waitFor(sb, 'message:deleted');
   await gql(alice.accessToken, 'mutation($m:ID!){ DeleteMessage(messageId:$m) }', { m: sent.data.SendMessage.id });
   ok(!!(await delEvt), 'message:deleted broadcast');
-  const after = await gql(alice.accessToken, '{ GetConversations { lastMessage { id content } } }');
-  ok(after.data.GetConversations[0].lastMessage?.content !== 'hi bob', 'lastMessage repointed after delete');
+  const after = await gql(alice.accessToken, '{ GetConversations { id lastMessage { id content } } }');
+  ok(bobConv(after.data.GetConversations).lastMessage?.id !== sent.data.SendMessage.id, 'lastMessage repointed after delete');
+
+  // ---- Photos ----
+  // 1x1 PNG
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+  const uploadPhoto = async (token, conversationId, bytes, name = 'photo.png', type = 'image/png') => {
+    const form = new FormData();
+    form.append('conversationId', conversationId);
+    form.append('photo', new Blob([bytes], { type }), name);
+    const res = await fetch(BASE + '/api/media', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form });
+    return { status: res.status, json: await res.json().catch(() => null) };
+  };
+  const bobGotPhoto = waitFor(sb, 'message:new', 4000, (m) => m.type === 'image');
+  const up = await uploadPhoto(alice.accessToken, conv.id, png);
+  const photoMsg = up.json?.data?.message;
+  ok(up.status === 201 && photoMsg?.type === 'image' && /^\/api\/media\/[0-9a-f-]{36}$/.test(photoMsg.content), 'photo upload creates an image message');
+  const photoEvt = await bobGotPhoto;
+  ok(photoEvt && photoEvt.id === photoMsg?.id, 'bob receives the photo message in real time');
+  const dl = await fetch(BASE + photoMsg.content, { headers: { Authorization: `Bearer ${bob.accessToken}` } });
+  const dlBytes = Buffer.from(await dl.arrayBuffer());
+  ok(dl.status === 200 && dl.headers.get('content-type') === 'image/png' && dlBytes.equals(png), 'bob can download the photo');
+  const spyDl = await fetch(BASE + photoMsg.content, { headers: { Authorization: `Bearer ${charlie.accessToken}` } });
+  ok(spyDl.status === 404, 'charlie CANNOT download a photo from a chat he is not in');
+  const anonDl = await fetch(BASE + photoMsg.content);
+  ok(anonDl.status === 401, 'photo download requires login');
+  const fake = await uploadPhoto(alice.accessToken, conv.id, Buffer.from('<svg onload=alert(1)>hi</svg>'), 'x.png', 'image/png');
+  ok(fake.status === 400, 'non-image file disguised as .png is rejected');
+  const charlieUp = await uploadPhoto(charlie.accessToken, conv.id, png);
+  ok(charlieUp.status === 404, 'charlie CANNOT post a photo into alice/bob chat');
+  const forged = await gql(alice.accessToken, 'mutation($c:ID!){ SendMessage(conversationId:$c, content:"https://evil.example/x.png", type:image){ id } }', { c: conv.id });
+  ok(!!forged.errors, 'image messages cannot be forged through GraphQL');
+  await gql(alice.accessToken, 'mutation($m:ID!){ DeleteMessage(messageId:$m) }', { m: photoMsg.id });
+  const goneDl = await fetch(BASE + photoMsg.content, { headers: { Authorization: `Bearer ${bob.accessToken}` } });
+  ok(goneDl.status === 404, 'deleting the message deletes the photo');
 
   // ---- Calls ----
   const offer = { type: 'offer', sdp: 'v=0\r\n' };

@@ -109,4 +109,25 @@ export const migrations: Migration[] = [
       CREATE INDEX call_records_receiver_idx ON call_records (receiver_id, created_at DESC);
     `,
   },
+  {
+    version: 2,
+    name: 'chat_media',
+    sql: `
+      -- Photos sent in chats. Stored in the database so they survive restarts and
+      -- hosting without a separate file store; deleted together with their message.
+      CREATE TABLE media (
+        id               uuid PRIMARY KEY,
+        message_id       uuid NOT NULL UNIQUE REFERENCES messages (id) ON DELETE CASCADE,
+        conversation_id  uuid NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+        uploader_id      uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        mime_type        text NOT NULL CHECK (mime_type IN ('image/jpeg', 'image/png', 'image/webp', 'image/gif')),
+        size_bytes       integer NOT NULL CHECK (size_bytes > 0),
+        width            integer,
+        height           integer,
+        data             bytea NOT NULL,
+        created_at       timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX media_conversation_idx ON media (conversation_id);
+    `,
+  },
 ];

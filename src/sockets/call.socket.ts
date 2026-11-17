@@ -11,7 +11,7 @@ import { isUserOnline } from './socketManager';
  *   call:initiate         { receiverId, callType, conversationId?, offer }
  *   call:accept           { callId, answer }
  *   call:reject           { callId, reason? }
- *   call:end              { callId }
+ *   call:end              { callId, reason?: 'connection-lost' }
  *   webrtc:ice-candidate  { callId, candidate }
  *
  * server -> client
@@ -220,10 +220,18 @@ export const registerCallHandlers = (io: Server, socket: Socket): void => {
     await finalizeCall(io, call, 'rejected', userId);
   });
 
-  socket.on('call:end', async (payload: { callId?: string } = {}) => {
+  socket.on('call:end', async (payload: { callId?: string; reason?: string } = {}) => {
     const call = getCallForUser(payload?.callId, userId);
     if (!call) return;
-    const reason: EndReason = call.acceptedAt ? 'ended' : userId === call.callerId ? 'cancelled' : 'rejected';
+    // A client that lost the media connection says so, so the other side is told why
+    const reason: EndReason =
+      call.acceptedAt && payload?.reason === 'connection-lost'
+        ? 'disconnected'
+        : call.acceptedAt
+          ? 'ended'
+          : userId === call.callerId
+            ? 'cancelled'
+            : 'rejected';
     await finalizeCall(io, call, reason, userId);
   });
 

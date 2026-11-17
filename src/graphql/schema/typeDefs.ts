@@ -116,6 +116,12 @@ export const typeDefs = `#graphql
     MarkConversationAsRead(conversationId: ID!): Conversation!
     DeleteMessage(messageId: ID!): Boolean!
     CreateCallRecord(input: CreateCallInput!): CallRecord!
-    UpdateCallStatus(callId: ID!, status: CallStatus!, duration: Int): CallRecord!
+    "Calls are normally recorded by the server during socket signaling. A finished call cannot be changed."
+    UpdateCallStatus(
+      callId: ID!
+      status: CallStatus!
+      "Ignored: the server measures the duration from when the call was answered."
+      duration: Int @deprecated(reason: "The server measures call duration.")
+    ): CallRecord!
   }
 `;

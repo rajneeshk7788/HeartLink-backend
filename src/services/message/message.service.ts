@@ -131,6 +131,10 @@ export class MessageService {
     if (!MESSAGE_TYPES.includes(type)) {
       throw new Error('Invalid message type');
     }
+    if (type !== 'text') {
+      // Photos go through POST /api/media so they always point at a stored, access-checked file
+      throw new Error('Only text messages can be sent here; send photos with the upload API');
+    }
     await MessageService.assertParticipant(conversationId, senderId);
 
     const message = await withTransaction(async (tx) => {

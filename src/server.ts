@@ -9,6 +9,7 @@ import { Server as SocketIOServer, Socket } from 'socket.io';
 import { config, isOriginAllowed } from './config';
 import { connectDB, disconnectDB } from './db';
 import authRoutes from './routes/auth.routes';
+import mediaRoutes from './routes/media.routes';
 import { typeDefs } from './graphql/schema/typeDefs';
 import { resolvers, GraphQLContext } from './graphql/resolvers';
 import { getContextUserFromToken } from './middleware/auth.middleware';
@@ -73,8 +74,9 @@ async function startServer() {
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-  // REST API Routes - Strictly Authentication Only
+  // REST API Routes: authentication, plus chat photo upload/download (binary data)
   app.use('/api/auth', authRoutes);
+  app.use('/api/media', mediaRoutes);
 
   // Health check endpoint
   app.get('/api/health', (req: Request, res: Response) => {

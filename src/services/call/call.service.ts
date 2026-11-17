@@ -66,15 +66,25 @@ export class CallService {
     if (!CALL_STATUSES.includes(status)) {
       throw new Error('Invalid call status');
     }
-    const existing = await queryOne<{ caller_id: string; receiver_id: string }>(
-      'SELECT caller_id::text AS caller_id, receiver_id::text AS receiver_id FROM call_records WHERE id = $1',
+    const existing = await queryOne<{ caller_id: string; receiver_id: string; status: CallStatus; answered_secs: number | null }>(
+      `SELECT caller_id::text AS caller_id, receiver_id::text AS receiver_id, status,
+              CASE WHEN status = 'accepted' THEN EXTRACT(EPOCH FROM (now() - started_at))::int END AS answered_secs
+         FROM call_records WHERE id = $1`,
       [callId]
     );
     if (!existing) {
       throw new Error('Call record not found');
     }
-    if (actingUserId && existing.caller_id !== actingUserId && existing.receiver_id !== actingUserId) {
-      throw new Error('Not authorized to update this call');
+    if (actingUserId) {
+      // Client-driven update (GraphQL): only the two parties, never a finished call,
+      // and the duration is measured by the server, not taken from the client.
+      if (existing.caller_id !== actingUserId && existing.receiver_id !== actingUserId) {
+        throw new Error('Not authorized to update this call');
+      }
+      if (FINAL_STATUSES.includes(existing.status)) {
+        throw new Error('This call has already ended');
+      }
+      duration = existing.answered_secs ?? 0;
     }
 
     const isFinal = FINAL_STATUSES.includes(status);
