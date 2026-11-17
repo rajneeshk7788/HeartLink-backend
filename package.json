@@ -8,6 +8,7 @@
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "test:db": "ts-node --transpile-only src/db-check.ts",
+    "db:show": "node scripts/db-show.js",
     "test:smoke": "node scripts/smoke-test.js",
     "typecheck": "tsc --noEmit",
     "db:check": "node dist/db-check.js"
